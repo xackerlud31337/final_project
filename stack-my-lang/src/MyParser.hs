@@ -86,6 +86,9 @@ stmt = try decl
     <|> try assign 
     <|> try printStmt
     --additional statement types will go here later
+    <|> try ifStmt
+    <|> try whileStmt
+    <|> block
 
 decl :: Parser Stmt
 decl = do
@@ -108,6 +111,24 @@ printStmt = do
     e <- expr
     semi
     return $ Print e
+
+ifStmt :: Parser Stmt
+ifStmt = do
+    reserved "if"
+    cond <- parens expr
+    Block thenBlock <- block
+    elseBlock <- optionMaybe (reserved "else" >> (do Block b <- block; return b))
+    return $ If cond thenBlock elseBlock
+
+whileStmt :: Parser Stmt
+whileStmt = do
+    reserved "while"
+    cond <- parens expr
+    Block body <- block
+    return $ While cond body
+
+block :: Parser Stmt
+block = Block <$> braces (many stmt)
 
 --Placeholder top-lecel program parser
 program :: Parser [Stmt]
