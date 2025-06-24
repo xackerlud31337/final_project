@@ -88,7 +88,24 @@ stmt = try decl
     --additional statement types will go here later
     <|> try ifStmt
     <|> try whileStmt
+    <|> try forkJoinStmt
+    <|> try lockStmt
     <|> block
+
+forkJoinStmt :: Parser Stmt
+forkJoinStmt = do
+    reserved "fork"
+    Block body <- block
+    reserved "join"
+    semi
+    return $ ForkJoin body
+
+lockStmt :: Parser Stmt
+lockStmt = do
+    reserved "lock"
+    lockName <- identifier
+    Block body <- block
+    return $ Lock lockName body
 
 decl :: Parser Stmt
 decl = do
