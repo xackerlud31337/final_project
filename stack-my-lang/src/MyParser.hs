@@ -1,5 +1,5 @@
 module MyParser
-    ( parseMyLang
+    ( parseMyLang, Stmt
     ) where
 
 import Text.Parsec
@@ -34,9 +34,16 @@ data Stmt
     deriving (Show, Eq)
 
 -- Lexer
+-- the (i) will replace the (int) 
+-- the (am) will replace the (bool)
+-- the (a) will replace the (true)
+-- the (cs) will replace the (false)
+-- the (major) will replace the (if)
+-- the (having) will replace the (else) 
+-- the (fun) will replace the (while)
 languageDef = emptyDef
   { Tok.commentLine     = "//"
-  , Tok.reservedNames   = ["int", "bool", "true", "false", "if", "else", "while", "print", "fork", "join", "lock"]
+    , Tok.reservedNames   = ["i", "am", "a", "cs", "major", "having", "fun", "print", "fork", "join", "lock"]
   , Tok.reservedOpNames = ["+", "-", "*", "/", "==", "!=", "<", "<=", ">", ">=", "&&", "||", "!", "="]
   }
 
@@ -57,8 +64,8 @@ expr = Ex.buildExpressionParser table term
 
 term :: Parser Expr
 term = parens expr
-    <|> (BoolLit True <$ reserved "true")
-    <|> (BoolLit False <$ reserved "false")
+    <|> (BoolLit True <$ reserved "a")
+    <|> (BoolLit False <$ reserved "cs")
     <|> (IntLit <$> integer)
     <|> (Var <$> identifier)
 
@@ -109,7 +116,7 @@ lockStmt = do
 
 decl :: Parser Stmt
 decl = do
-    typ <- (TypeInt <$ reserved "int") <|> (TypeBool <$ reserved "bool") 
+    typ <- (TypeInt <$ reserved "i") <|> (TypeBool <$ reserved "am")  
     varName <- identifier 
     semi 
     return $ Decl typ varName
@@ -131,15 +138,15 @@ printStmt = do
 
 ifStmt :: Parser Stmt
 ifStmt = do
-    reserved "if"
+    reserved "major"
     cond <- parens expr
     Block thenBlock <- block
-    elseBlock <- optionMaybe (reserved "else" >> (do Block b <- block; return b))
+    elseBlock <- optionMaybe (reserved "having" >> (do Block b <- block; return b))
     return $ If cond thenBlock elseBlock
 
 whileStmt :: Parser Stmt
 whileStmt = do
-    reserved "while"
+    reserved "fun"
     cond <- parens expr
     Block body <- block
     return $ While cond body
@@ -147,10 +154,12 @@ whileStmt = do
 block :: Parser Stmt
 block = Block <$> braces (many stmt)
 
---Placeholder top-lecel program parser
+-- Placeholder top-level program parser
 program :: Parser [Stmt]
 program = whiteSpace >> many stmt
 
 --Public function
 parseMyLang :: String -> Either String [Stmt]
 parseMyLang = left show . parse (program <* eof) "<stdin>"
+
+-- compileProgram :: [Stmt] -> [Instruction]
