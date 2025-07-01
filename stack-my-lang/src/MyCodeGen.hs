@@ -3,6 +3,8 @@ module MyCodeGen
 
 import Sprockell
 import MyParser (Stmt(..), Expr(..))
+import MyCompiler
+
 
 -- Entry point
 codeGen :: [Stmt] -> [Instruction]
