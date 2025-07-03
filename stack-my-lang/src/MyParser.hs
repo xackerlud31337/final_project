@@ -1,5 +1,5 @@
 module MyParser
-    ( parseMyLang, Stmt
+    ( parseMyLang, Stmt(..), Expr(..)
     ) where
 
 import Text.Parsec
