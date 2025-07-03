@@ -3,6 +3,8 @@ module MyCodeGen
 
 import Sprockell
 import MyParser (Stmt(..), Expr(..))
+import MyCompiler
+
 
 -- This is the correct type for integration with Main.hs
 codeGen :: [Stmt] -> [Instruction]
