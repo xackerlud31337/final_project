@@ -47,7 +47,7 @@ languageDef :: Tok.LanguageDef ()
 languageDef = emptyDef
   { Tok.commentLine     = "//"
   , Tok.reservedNames   = ["i","am","a","cs","major","having","fun","print","fork","join","lock"]
-  , Tok.reservedOpNames = ["+","-","*","/","==","!=","<","<=" ,">",">=","&&","||","!","="]
+  , Tok.reservedOpNames = ["+","-","*","==","!=","<","<=" ,">",">=","&&","||","!","="]
   }
 
 lexer :: Tok.TokenParser ()
@@ -91,7 +91,7 @@ term =  parens expr
 table :: [[Ex.Operator String () Identity Expr]]
 table =
   [ [prefix "!" UnOp]
-  , [binary "*" (BinOp "*") Ex.AssocLeft, binary "/" (BinOp "/") Ex.AssocLeft]
+  , [binary "*" (BinOp "*") Ex.AssocLeft]
   , [binary "+" (BinOp "+") Ex.AssocLeft, binary "-" (BinOp "-") Ex.AssocLeft]
   , [ binary "==" (BinOp "==") Ex.AssocNone
     , binary "!=" (BinOp "!=") Ex.AssocNone

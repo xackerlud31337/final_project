@@ -1,62 +1,115 @@
 module MyCodeGen
-    ( codeGen ) where
+  ( compileSource
+  , compileAST
+  ) where
 
-import Sprockell (Instruction(..))
-import MyParser (Stmt(..), Expr(..))
-import MyCompiler
+import Prelude hiding (lookup)
+import MyParser (parseMyLang, Stmt(..), Expr(..))
+import Sprockell.BasicFunctions (regA, regB, regC, regD, regE, regF)
+import Sprockell.HardwareTypes
+
+type Env  = [(String, Int)]
+
+type Slot = Int
+
+compileSource :: String -> Either String [Instruction]
+compileSource src =
+  case parseMyLang src of
+    Left err  -> Left err
+    Right ast -> Right (compileAST ast)
+
+compileAST :: [Stmt] -> [Instruction]
+compileAST stmts =
+  let (_, _, code) = foldl genStmt ([], 0, []) stmts
+  in code ++ [EndProg]
+
+genStmt :: (Env, Slot, [Instruction]) -> Stmt -> (Env, Slot, [Instruction])
+genStmt (env, nxt, code) stmt = case stmt of
+  Decl _ name ->
+    let slot   = nxt
+        instrs = [ Load (ImmValue 0) regA
+                 , Store regA (DirAddr slot)
+                 ]
+    in ((name,slot):env, slot+1, code ++ instrs)
+
+  Assign name expr ->
+    let slot     = lookup name env
+        exprCode = compileExpr env regA expr
+    in (env, nxt, code ++ exprCode ++ [Store regA (DirAddr slot)])
+
+  Print expr ->
+    let exprCode = compileExpr env regA expr
+    in (env, nxt, code ++ exprCode ++ [WriteInstr regA (DirAddr 0x10000)])
+
+  Block ss ->
+    let (env', nxt', code') = foldl genStmt (env, nxt, []) ss
+    in (env, nxt', code ++ code')
+
+  If cond thn mEls ->
+    let condC       = compileExpr env regA cond
+        (_, nxt1, thnC) = foldl genStmt (env, nxt, []) thn
+        (_, nxt2, elsC) = maybe (env, nxt1, []) (foldl genStmt (env, nxt1, [])) mEls
+        thnLen      = length thnC
+        elsLen      = length elsC
+        offThen     = thnLen + 2
+        offEnd      = elsLen  + 1
+    in (env, max nxt1 nxt2, code
+         ++ condC
+         ++ [Branch regA (Rel offThen)]
+         ++ thnC
+         ++ [Jump (Rel offEnd)]
+         ++ elsC)
+
+  While cond body ->
+    let condC       = compileExpr env regA cond
+        (_, nxt', bdyC) = foldl genStmt (env, nxt, []) body
+        condLen     = length condC + 1
+        bodyLen     = length bdyC + 1
+        offSkip     = condLen
+        offBack     = -(condLen + bodyLen)
+    in (env, nxt', code
+         ++ condC
+         ++ [Branch regA (Rel offSkip)]
+         ++ bdyC
+         ++ [Jump (Rel offBack)])
+
+  ForkJoin ss ->
+    let (_, nxt', fC) = foldl genStmt (env, nxt, []) ss
+    in (env, nxt', code ++ fC)
+
+  Lock _ ss ->
+    let (_, nxt', lC) = foldl genStmt (env, nxt, []) ss
+    in (env, nxt', code ++ lC)
+
+type Reg = Int
+compileExpr :: Env -> Reg -> Expr -> [Instruction]
+compileExpr env tgt expr = case expr of
+  IntLit n     -> [Load (ImmValue (fromIntegral n)) tgt]
+  BoolLit b    -> [Load (ImmValue (if b then 1 else 0)) tgt]
+  Var x        -> [Load (DirAddr (lookup x env)) tgt]
+  BinOp op l r ->
+    let lC = compileExpr env tgt l
+        rC = compileExpr env regB r
+    in lC ++ rC ++ [Compute (toOp op) tgt regB tgt]
+  UnOp "!" e  -> compileExpr env tgt e ++ [Compute Xor tgt tgt tgt]
+  _            -> error $ "Unsupported Expr: " ++ show expr
 
 
--- -- Entry point
--- codeGen :: String -> [Instruction]
--- codeGen stmts = prettyInstructions (compileString "i x; x = 2*3+1; print x;")
+toOp :: String -> Operator
+toOp "+"  = Add
+toOp "-"  = Sub
+toOp "*"  = Mul
+toOp "==" = Equal
+toOp "!=" = NEq
+toOp "<"  = Lt
+toOp "<=" = LtE
+toOp ">"  = Gt
+toOp ">=" = GtE
+toOp "&&" = And
+toOp "||" = Or
+toOp _     = error "Unknown operator"
 
--- -- Compile a statement into Sprockell instructions
--- compileStmt :: Stmt -> [Instruction]
--- compileStmt stmt = case stmt of
---     Print e       -> compileExpr e ++ [WriteInstr regA numberIO]
---     Assign _ _    -> [] -- placeholder
---     Decl _ _      -> [] -- placeholder
---     If _ _ _      -> [] -- not implemented yet
---     While _ _     -> [] -- not implemented yet
---     ForkJoin _    -> [] -- not implemented yet
---     Lock _ _      -> [] -- not implemented yet
---     Block ss      -> concatMap compileStmt ss
-
--- -- Compile an expression into Sprockell instructions
--- -- Result will be in regA
--- compileExpr :: Expr -> [Instruction]
--- compileExpr expr = case expr of
---     IntLit n        -> [Load (ImmValue $ fromInteger n) regA]
---     BinOp "+" l r   -> compileBinary l r Add
---     BinOp "-" l r   -> compileBinary l r Sub
---     BinOp "*" l r   -> compileBinary l r Mul
---     BinOp "/" l r   -> compileBinary l r Div
---     _               -> [NOP] -- unsupported expr
-
-
-
-prog :: String -> [Instruction]
-prog x = compileString x
-
-
--- prog :: [Instruction]
--- prog = [ Load (ImmValue 2) regA
---         , Load (ImmValue 3) regB
---         , Compute Mul regA regB regA
---         , Load (ImmValue 1) regB
---         , Compute Add regA regB regA
---         , WriteInstr regA numberIO
---         , EndProg
---        ]
-
--- This is the correct type for integration with Main.hs
-codeGen :: [Stmt] -> [Instruction]
-codeGen stmts = concatMap compileStmt stmts ++ [EndProg]
-
--- Dummy implementation: just handle printing ints
-compileStmt :: Stmt -> [Instruction]
-compileStmt (Print (IntLit n)) =
-    [ Load (ImmValue $ fromInteger n) regA
-    , WriteInstr regA numberIO
-    ]
-compileStmt _ = []  -- other statements not implemented yet
+lookup :: String -> Env -> Int
+lookup k env = case [s | (x,s) <- env, x == k] of
+  (s:_) -> s
+  []    -> error $ "Variable not found: " ++ k

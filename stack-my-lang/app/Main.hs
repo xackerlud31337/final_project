@@ -1,16 +1,30 @@
 module Main where
 
-import MyParser (parseMyLang)
-import MyCodeGen (codeGen, prog)
-import Sprockell (run, Instruction)
+import MyParser
+import MyCodeGen
+import Sprockell
 
--- Compiles a number into a spril program producing all fibonacci numbers below the number
--- Compilation might fail
-compile :: String -> Either String [Instruction]
-case parseMyLang src of
-    Left err    -> error err
-    Right stmts -> let (instrs, _, _) = compileStmtsWithLabels regPool 0 stmts in instrs ++ [EndProg]
+showLocalMem :: DbgInput -> String
+showLocalMem ( _ , systemState ) = show $ localMem $ head $ sprStates systemState
 
--- Gets a number and runs the resulting spril program of compilation succeeds
+doesLocalMemWrite :: DbgInput -> Bool
+doesLocalMemWrite (instrs,st) = any isStoreInstr instrs
+    where
+        isStoreInstr (Store _ _) = True
+        isStoreInstr _           = False
+
+showAllRegisters :: DbgInput -> String
+showAllRegisters ( _ , systemState ) = show $ map regbank $ sprStates systemState
+
+runFile :: FilePath -> IO ()
+runFile path = do
+  src <- readFile path
+  case parseMyLang src of
+    Left err -> putStrLn ("Error parsing " ++ path ++ ": " ++ err)
+    Right ast -> do
+      let instrs = compileAST ast
+      run [instrs]
+      -- runWithDebugger (debuggerSimplePrint showAllRegisters) [instrs]
+    
 main :: IO ()
-main = run [prog]
+main = runFile "funcs.siw"
