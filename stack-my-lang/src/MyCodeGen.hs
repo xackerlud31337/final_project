@@ -5,32 +5,41 @@ module MyCodeGen
 
 import Prelude hiding (lookup)
 import MyParser (parseMyLang, Stmt(..), Expr(..))
-import Sprockell.BasicFunctions (regA, regB, regC, regD, regE, regF)
+import Sprockell.BasicFunctions (regA, regB)
 import Sprockell.HardwareTypes
 
-type Env  = [(String, Int)]
+type Scope = [(String, Int)]
+type Env   = [Scope]
+type Slot  = Int
 
-type Slot = Int
-
-compileSource :: String -> Either String [Instruction]
+compileSource :: String -> [Instruction]
 compileSource src =
   case parseMyLang src of
-    Left err  -> Left err
-    Right ast -> Right (compileAST ast)
+    Left err  -> error err
+    Right ast -> compileAST ast
 
 compileAST :: [Stmt] -> [Instruction]
 compileAST stmts =
-  let (_, _, code) = foldl genStmt ([], 0, []) stmts
+  let initialEnv  = [ [] ]
+      initialSlot = 0
+      (_, _, code) = foldl genStmt (initialEnv, initialSlot, []) stmts
   in code ++ [EndProg]
 
 genStmt :: (Env, Slot, [Instruction]) -> Stmt -> (Env, Slot, [Instruction])
 genStmt (env, nxt, code) stmt = case stmt of
-  Decl _ name ->
-    let slot   = nxt
-        instrs = [ Load (ImmValue 0) regA
-                 , Store regA (DirAddr slot)
-                 ]
-    in ((name,slot):env, slot+1, code ++ instrs)
+  Decl _ name
+    | name `elem` map fst (head env)
+    -> error $ "Variable already declared in this scope: " ++ name
+    | otherwise
+    -> let slot   = nxt
+           instrs = [ Load (ImmValue 0) regA
+                    , Store regA (DirAddr slot)
+                    ]
+           newScope = (name, slot) : head env
+       in ( newScope : tail env
+          , slot + 1
+          , code ++ instrs
+          )
 
   Assign name expr ->
     let slot     = lookup name env
@@ -42,58 +51,60 @@ genStmt (env, nxt, code) stmt = case stmt of
     in (env, nxt, code ++ exprCode ++ [WriteInstr regA (DirAddr 0x10000)])
 
   Block ss ->
-    let (env', nxt', code') = foldl genStmt (env, nxt, []) ss
-    in (env, nxt', code ++ code')
+    let ( (_:outer), nxt', code') = foldl genStmt ( []:env, nxt, [] ) ss
+    in ( outer, nxt', code ++ code' )
 
   If cond thn mEls ->
-    let condC       = compileExpr env regA cond
-        (_, nxt1, thnC) = foldl genStmt (env, nxt, []) thn
-        (_, nxt2, elsC) = maybe (env, nxt1, []) (foldl genStmt (env, nxt1, [])) mEls
-        thnLen      = length thnC
-        elsLen      = length elsC
-        offThen     = thnLen + 2
-        offEnd      = elsLen  + 1
-    in (env, max nxt1 nxt2, code
-         ++ condC
-         ++ [Branch regA (Rel offThen)]
-         ++ thnC
-         ++ [Jump (Rel offEnd)]
-         ++ elsC)
+    let condC = compileExpr env regA cond
+        (_, nxtTh, thC) = foldl genStmt ( []:env, nxt, [] ) thn
+        ( _    , nxtEl, elC) = case mEls of
+          Just els -> foldl genStmt ( []:env, nxt, [] ) els
+          Nothing  -> ( []:env, nxt, [] )
+        nextSlot = max nxtTh nxtEl
+        thenLen  = length thC
+        elseLen  = length elC
+        offThen  = thenLen + 2
+        offEnd   = elseLen + 1
+        branchCode = condC
+                  ++ [ Branch regA (Rel offThen) ]
+                  ++ thC
+                  ++ [ Jump (Rel offEnd) ]
+                  ++ elC
+    in ( env, nextSlot, code ++ branchCode )
 
   While cond body ->
-    let condC       = compileExpr env regA cond
-        (_, nxt', bdyC) = foldl genStmt (env, nxt, []) body
-        condLen     = length condC + 1
-        bodyLen     = length bdyC + 1
-        offSkip     = condLen
-        offBack     = -(condLen + bodyLen)
-    in (env, nxt', code
-         ++ condC
-         ++ [Branch regA (Rel offSkip)]
-         ++ bdyC
-         ++ [Jump (Rel offBack)])
+    let condC        = compileExpr env regA cond
+        (_, nxtBd, bdC) = foldl genStmt ( []:env, nxt, [] ) body
+        cLen          = length condC
+        bLen          = length bdC
+        loopCode = condC
+                 ++ [ Branch regA (Rel 2)
+                    , Jump (Rel (bLen + 2))
+                    ]
+                 ++ bdC
+                 ++ [ Jump (Rel (-(cLen + bLen + 2))) ]
+    in ( env, nxtBd, code ++ loopCode )
 
   ForkJoin ss ->
-    let (_, nxt', fC) = foldl genStmt (env, nxt, []) ss
-    in (env, nxt', code ++ fC)
+    let ( (_:outer), nxt', code') = foldl genStmt ( []:env, nxt, [] ) ss
+    in ( outer, nxt', code ++ code' )
 
   Lock _ ss ->
-    let (_, nxt', lC) = foldl genStmt (env, nxt, []) ss
-    in (env, nxt', code ++ lC)
+    let ( (_:outer), nxt', code') = foldl genStmt ( []:env, nxt, [] ) ss
+    in ( outer, nxt', code ++ code' )
 
 type Reg = Int
 compileExpr :: Env -> Reg -> Expr -> [Instruction]
 compileExpr env tgt expr = case expr of
-  IntLit n     -> [Load (ImmValue (fromIntegral n)) tgt]
-  BoolLit b    -> [Load (ImmValue (if b then 1 else 0)) tgt]
-  Var x        -> [Load (DirAddr (lookup x env)) tgt]
+  IntLit n     -> [ Load (ImmValue (fromIntegral n)) tgt ]
+  BoolLit b    -> [ Load (ImmValue (if b then 1 else 0)) tgt ]
+  Var x        -> [ Load (DirAddr (lookup x env)) tgt ]
   BinOp op l r ->
     let lC = compileExpr env tgt l
         rC = compileExpr env regB r
-    in lC ++ rC ++ [Compute (toOp op) tgt regB tgt]
-  UnOp "!" e  -> compileExpr env tgt e ++ [Compute Xor tgt tgt tgt]
+    in lC ++ rC ++ [ Compute (toOp op) tgt regB tgt ]
+  UnOp "!" e  -> compileExpr env tgt e ++ [ Compute Xor tgt tgt tgt ]
   _            -> error $ "Unsupported Expr: " ++ show expr
-
 
 toOp :: String -> Operator
 toOp "+"  = Add
@@ -110,6 +121,8 @@ toOp "||" = Or
 toOp _     = error "Unknown operator"
 
 lookup :: String -> Env -> Int
-lookup k env = case [s | (x,s) <- env, x == k] of
-  (s:_) -> s
-  []    -> error $ "Variable not found: " ++ k
+lookup name [] = error $ "Variable not found: " ++ name
+lookup name (scope:rest) =
+  case [ slot | (n,slot) <- scope, n == name ] of
+    (s:_) -> s
+    []    -> lookup name rest

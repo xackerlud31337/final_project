@@ -1,20 +1,53 @@
-i n;
-i x;
-i y;
-i z;
-i b;
-i l;
-i k;
-i r;
-i u;
-n = 1;
-x = 2;
-y = 3;
-z = 4;
-b = 5;
-l = 6;
-k = 7;
-r = 8;
-u = 9;
-x = x + n + y + z + b + l + u + r + k;
-print x;
+i acct1;
+i acct2;
+acct1 = 1000;
+acct2 = 2000;
+
+fork {
+  i i1;
+  i1 = 0;
+  fun (i1 < 10) {
+    lock bank {
+      acct1 = acct1 + 100;
+    }
+    lock bank {
+      acct2 = acct2 - 50;
+    }
+    i1 = i1 + 1;
+  }
+  
+  i i2;
+  i2 = 0;
+  fun (i2 < 8) {
+    lock bank {
+      acct1 = acct1 - 200;
+    }
+    lock bank {
+      acct2 = acct2 + 150;
+    }
+    i2 = i2 + 1;
+  }
+  
+  i i3;
+  i3 = 0;
+  fun (i3 < 12) {
+    lock bank {
+      acct1 = acct1 - 30;
+      acct2 = acct2 + 30;
+    }
+    i3 = i3 + 1;
+  }
+  
+  i i4;
+  i4 = 0;
+  fun (i4 < 15) {
+    lock bank {
+      acct2 = acct2 - 20;
+      acct1 = acct1 + 20;
+    }
+    i4 = i4 + 1;
+  }
+} join;
+
+print acct1;
+print acct2;
