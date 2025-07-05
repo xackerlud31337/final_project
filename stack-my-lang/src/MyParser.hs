@@ -19,6 +19,7 @@ data Expr
   = IntLit Integer
   | BoolLit Bool
   | Var String
+  | StringLit String 
   | ArrayRef String Expr 
   | BinOp String Expr Expr
   | UnOp  String Expr
@@ -35,6 +36,7 @@ data Stmt
   | Lock   String [Stmt]
   | Block  [Stmt]
   | DeclVec String [Expr]
+  | DeclStr   String String
   deriving (Show, Eq)
 
 -- Lexer
@@ -48,7 +50,7 @@ data Stmt
 languageDef :: Tok.LanguageDef ()
 languageDef = emptyDef
   { Tok.commentLine     = "//"
-  , Tok.reservedNames   = ["i","am","a","cs","major","having","fun","print","fork","join","lock", "science"]
+  , Tok.reservedNames   = ["i","am","a","cs","major","having","fun","print","fork","join","lock","sci"]
   , Tok.reservedOpNames = ["+","-","*","==","!=","<","<=" ,">",">=","&&","||","!","=", "[","]"]
   }
 
@@ -82,15 +84,20 @@ integer = Tok.integer lexer
 whiteSpace :: Parser ()
 whiteSpace = Tok.whiteSpace lexer
 
+stringLiteral :: Parser String
+stringLiteral = Tok.stringLiteral lexer
+
 -- Expression parser
 expr :: Parser Expr
 expr = Ex.buildExpressionParser table term
 
 term :: Parser Expr
 term =  parens expr
+    <|> StringLit <$> Tok.stringLiteral lexer 
     <|> (BoolLit True  <$ reserved "a")
     <|> (BoolLit False <$ reserved "cs")
     <|> (IntLit   <$> integer)
+    <|> (StringLit <$> Tok.stringLiteral lexer)
     <|> try arrayRef
     <|> (Var      <$> identifier)
 
@@ -131,6 +138,7 @@ stmt =  try decl
     <|> try ifStmt
     <|> try whileStmt
     <|> try vecDecl
+    <|> try strDecl
     <|> try forkJoinStmt
     <|> try lockStmt
     <|> block
@@ -150,9 +158,18 @@ assign = do
   _ <- semi
   return $ Assign v e
 
+strDecl :: Parser Stmt
+strDecl = do
+  reserved "sci"
+  name <- identifier
+  reservedOp "="
+  s <- stringLiteral
+  semi
+  return $ DeclStr name s
+
 vecDecl :: Parser Stmt
 vecDecl = do
-  reserved "science"
+  reserved "sci"
   name <- identifier
   reservedOp "="
   elems <- Tok.brackets lexer (expr `sepBy` Tok.comma lexer)

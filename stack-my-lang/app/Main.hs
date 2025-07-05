@@ -27,4 +27,4 @@ runFile path = do
       -- runWithDebugger (debuggerSimplePrint showAllRegisters) [instrs]
     
 main :: IO ()
-main = runFile "testing.siw"
+main = runFile "funcs.siw"
