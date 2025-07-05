@@ -19,6 +19,7 @@ data Expr
   = IntLit Integer
   | BoolLit Bool
   | Var String
+  | ArrayRef String Expr 
   | BinOp String Expr Expr
   | UnOp  String Expr
   deriving (Show, Eq)
@@ -33,6 +34,7 @@ data Stmt
   | ForkJoin [Stmt]
   | Lock   String [Stmt]
   | Block  [Stmt]
+  | DeclVec String [Expr]
   deriving (Show, Eq)
 
 -- Lexer
@@ -46,8 +48,8 @@ data Stmt
 languageDef :: Tok.LanguageDef ()
 languageDef = emptyDef
   { Tok.commentLine     = "//"
-  , Tok.reservedNames   = ["i","am","a","cs","major","having","fun","print","fork","join","lock"]
-  , Tok.reservedOpNames = ["+","-","*","==","!=","<","<=" ,">",">=","&&","||","!","="]
+  , Tok.reservedNames   = ["i","am","a","cs","major","having","fun","print","fork","join","lock", "science"]
+  , Tok.reservedOpNames = ["+","-","*","==","!=","<","<=" ,">",">=","&&","||","!","=", "[","]"]
   }
 
 lexer :: Tok.TokenParser ()
@@ -68,6 +70,9 @@ parens = Tok.parens lexer
 braces :: Parser a -> Parser a
 braces = Tok.braces lexer
 
+brackets :: Parser a -> Parser a
+brackets = Tok.brackets lexer
+
 semi :: Parser String
 semi = Tok.semi lexer
 
@@ -86,6 +91,7 @@ term =  parens expr
     <|> (BoolLit True  <$ reserved "a")
     <|> (BoolLit False <$ reserved "cs")
     <|> (IntLit   <$> integer)
+    <|> try arrayRef
     <|> (Var      <$> identifier)
 
 table :: [[Ex.Operator String () Identity Expr]]
@@ -124,6 +130,7 @@ stmt =  try decl
     <|> try printStmt
     <|> try ifStmt
     <|> try whileStmt
+    <|> try vecDecl
     <|> try forkJoinStmt
     <|> try lockStmt
     <|> block
@@ -142,6 +149,21 @@ assign = do
   e <- expr
   _ <- semi
   return $ Assign v e
+
+vecDecl :: Parser Stmt
+vecDecl = do
+  reserved "science"
+  name <- identifier
+  reservedOp "="
+  elems <- Tok.brackets lexer (expr `sepBy` Tok.comma lexer)
+  _ <- semi
+  return $ DeclVec name elems
+
+arrayRef :: Parser Expr
+arrayRef = do
+  name <- identifier
+  idx  <- brackets expr
+  return $ ArrayRef name idx
 
 printStmt :: Parser Stmt
 printStmt = do
