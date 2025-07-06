@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.36.0.
+-- This file has been generated from package.yaml by hpack version 0.37.0.
 --
 -- see: https://github.com/sol/hpack
 
@@ -14,7 +14,7 @@ license:        MIT
 license-file:   LICENSE
 build-type:     Simple
 extra-source-files:
-    README_boilerplate.md
+    README.md
 
 library
   exposed-modules:
@@ -52,6 +52,8 @@ test-suite my-lang-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      MyCodeGenSpec
+      MyParserSpec
       Paths_my_lang
   hs-source-dirs:
       test
