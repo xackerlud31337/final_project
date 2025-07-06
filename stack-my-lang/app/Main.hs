@@ -24,7 +24,10 @@ runFile path = do
     Right ast -> do
       let instrs = compileAST ast
       run [instrs]
-      -- runWithDebugger (debuggerSimplePrint showAllRegisters) [instrs]
+      --runWithDebugger (debuggerSimplePrint showAllRegisters) [instrs]
     
 main :: IO ()
-main = runFile "funcs.siw"
+main = do
+  putStrLn "Enter the name of the file to run:"
+  fileName <- getLine
+  runFile fileName

@@ -9,174 +9,221 @@ import Data.Char (ord)
 import MyParser (parseMyLang, Stmt(..), Expr(..))
 import Sprockell
 
--- | Element types (for vectors/strings)
-data ElemType = ETInt | ETChar deriving (Eq, Show)
 
--- | Variable metadata: scalar or vector
---   Scalars occupy one slot; vectors occupy consecutive slots with an element type.
-data VarInfo
-  = VarScalar Int              -- single slot
-  | VarVector Int Int ElemType -- base slot, length, element type
+data ElementType = ElementInt | ElementChar deriving (Eq, Show)
+data VariableInfo
+  = ScalarVariable Int
+  | VectorVariable Int Int ElementType
 
--- | A scope maps names to VarInfo; Env is a stack of scopes
-type Scope = [(String, VarInfo)]
-type Env   = [Scope]
-type Slot  = Int
+type Scope = [(String, VariableInfo)]
+type Environment = [Scope]
+type MemorySlot = Int
+type Register = Int
 
--- | Entry point: compile source text to Sprockell instructions
+
 compileSource :: String -> [Instruction]
-compileSource src =
-  case parseMyLang src of
-    Left err  -> error $ show err
-    Right ast -> compileAST ast
+compileSource source =
+  case parseMyLang source of
+    Left parseError  -> error $ show parseError
+    Right ast        -> compileAST ast
+
 
 compileAST :: [Stmt] -> [Instruction]
-compileAST stmts =
-  let initialEnv  = [ [] ]
-      initialSlot = 0
-      (_, _, body) = foldl genStmt (initialEnv, initialSlot, []) stmts
-  in body ++ [EndProg]
+compileAST statements =
+  let initialEnvironment = [ [] ]
+      initialMemorySlot = 0
+      (_, _, instructions) = foldl generateStatement (initialEnvironment, initialMemorySlot, []) statements
+  in instructions ++ [EndProg]
 
--- | Lookup a scalar variable slot
-lookupScalar :: String -> Env -> Int
-lookupScalar name [] = error $ "Variable not found or not scalar: " ++ name
-lookupScalar name (scope:rest) =
-  case lookup name scope of
-    Just (VarScalar s)     -> s
-    Just (VarVector _ _ _) -> error $ "Expected scalar but found vector: " ++ name
-    Nothing                -> lookupScalar name rest
 
--- | Lookup a vector: returns (base, length, elemType)
-lookupVector :: String -> Env -> (Int, Int, ElemType)
-lookupVector name [] = error $ "Variable not found or not vector: " ++ name
-lookupVector name (scope:rest) =
-  case lookup name scope of
-    Just (VarVector b l et) -> (b, l, et)
-    Just (VarScalar _)      -> error $ "Expected vector but found scalar: " ++ name
-    Nothing                 -> lookupVector name rest
+lookupScalar :: String -> Environment -> Int
+lookupScalar variableName [] = error $ "Not found or not scalar: " ++ variableName
+lookupScalar variableName (scope:outerScopes) =
+  case lookup variableName scope of
+    Just (ScalarVariable slot) -> slot
+    _                         -> lookupScalar variableName outerScopes
 
--- | Code generator for statements
-genStmt :: (Env, Slot, [Instruction]) -> Stmt -> (Env, Slot, [Instruction])
-genStmt (env, nxt, code) stmt = case stmt of
-  -- scalar declaration: i x; or am y;
-  Decl _ name
-    | name `elem` map fst (head env)
-    -> error $ "Variable already declared: " ++ name
+
+lookupVector :: String -> Environment -> (Int, Int, ElementType)
+lookupVector variableName [] = error $ "Not found or not vector: " ++ variableName
+lookupVector variableName (scope:outerScopes) =
+  case lookup variableName scope of
+    Just (VectorVariable base length elementType) -> (base, length, elementType)
+    _                                            -> lookupVector variableName outerScopes
+
+
+generateStatement :: (Environment, MemorySlot, [Instruction]) -> Stmt -> (Environment, MemorySlot, [Instruction])
+generateStatement (environment, nextSlot, instructions) statement = case statement of
+  Decl _ variableName
+    | variableName `elem` map fst (head environment)
+      -> error $ "Variable already declared: " ++ variableName
     | otherwise
-    -> let slot     = nxt
-           initI    = [ Load (ImmValue 0) regA, Store regA (DirAddr slot) ]
-           newScope = (name, VarScalar slot) : head env
-       in ( newScope : tail env, slot + 1, code ++ initI )
+      -> let slot = nextSlot
+             initInstructions = [ Load (ImmValue 0) regA, Store regA (DirAddr slot) ]
+             newScope = (variableName, ScalarVariable slot) : head environment
+         in (newScope : tail environment, slot + 1, instructions ++ initInstructions)
 
-  -- string literal: sci s = "...";
-  DeclStr name s
-    | name `elem` map fst (head env)
-    -> error $ "Variable already declared: " ++ name
+  DeclStr variableName stringValue
+    | variableName `elem` map fst (head environment)
+      -> error $ "Variable already declared: " ++ variableName
     | otherwise
-    -> let len      = length s
-           base     = nxt
-           initC    = concat
-             [ [ Load (ImmValue (ord c)) regA
-               , Store regA (DirAddr (base + i)) ]
-             | (i,c) <- zip [0..] s ]
-           termC    = [ Load (ImmValue 0) regA, Store regA (DirAddr (base + len)) ]
-           newScope = (name, VarVector base (len + 1) ETChar) : head env
-       in ( newScope : tail env, base + len + 1, code ++ initC ++ termC )
+      -> let strLength = length stringValue
+             baseSlot = nextSlot
+             charInstructions = concat [ [ Load (ImmValue (ord char)) regA
+                                         , Store regA (DirAddr (baseSlot + i)) ]
+                                       | (i, char) <- zip [0..] stringValue ]
+             terminatorInstructions = [ Load (ImmValue 0) regA, Store regA (DirAddr (baseSlot + strLength)) ]
+             newScope = (variableName, VectorVariable baseSlot (strLength + 1) ElementChar) : head environment
+         in (newScope : tail environment, baseSlot + strLength + 1, instructions ++ charInstructions ++ terminatorInstructions)
 
-  -- vector literal: sci v = [e1,e2,...];
-  DeclVec name elems
-    | name `elem` map fst (head env)
-    -> error $ "Variable already declared: " ++ name
+  DeclVec variableName elements
+    | variableName `elem` map fst (head environment)
+      -> error $ "Variable already declared: " ++ variableName
     | otherwise
-    -> let len      = length elems
-           base     = nxt
-           storeC   = concat [ compileExpr env regA e ++ [ Store regA (DirAddr (base + i)) ]
-                             | (i,e) <- zip [0..] elems ]
-           newScope = (name, VarVector base len ETInt) : head env
-       in ( newScope : tail env, base + len, code ++ storeC )
+      -> let vecLength = length elements
+             baseSlot = nextSlot
+             storeInstructions = concat [ compileExpr environment regA expr ++ [ Store regA (DirAddr (baseSlot + i)) ]
+                                       | (i, expr) <- zip [0..] elements ]
+             newScope = (variableName, VectorVariable baseSlot vecLength ElementInt) : head environment
+         in (newScope : tail environment, baseSlot + vecLength, instructions ++ storeInstructions)
 
-  -- assignment: x = expr;
-  Assign name expr
-    -> let slot  = lookupScalar name env
-           ecs   = compileExpr env regA expr
-       in (env, nxt, code ++ ecs ++ [ Store regA (DirAddr slot) ])
+  Assign variableName expr
+    -> let slot = lookupScalar variableName environment
+           exprInstructions = compileExpr environment regA expr
+       in (environment, nextSlot, instructions ++ exprInstructions ++ [ Store regA (DirAddr slot) ])
 
-  -- print: print expr;
   Print expr ->
-    let ecs = compileExpr env regA expr
-        dev = case expr of
+    let exprInstructions = compileExpr environment regA expr
+        device = case expr of
           StringLit _  -> charIO
           ArrayRef _ _ -> charIO
           _            -> numberIO
-    in  (env, nxt, code ++ ecs ++ [ WriteInstr regA dev ])
+    in (environment, nextSlot, instructions ++ exprInstructions ++ [ WriteInstr regA device ])
 
-  -- block: { ... }
-  Block ss
-    -> let (_:outer, nxt', bc) = foldl genStmt ( []:env, nxt, [] ) ss
-       in (outer, nxt', code ++ bc)
+  Block statements ->
+    let (_:outerScopes, nextSlot', blockInstructions) = foldl generateStatement ([]:environment, nextSlot, []) statements
+    in (outerScopes, nextSlot', instructions ++ blockInstructions)
 
-  -- if/major ... having
-  If cond thn mEls
-    -> let cc       = compileExpr env regA cond
-           (_, nTh, thC) = foldl genStmt ( []:env, nxt, [] ) thn
-           (_, nEl, elC) = case mEls of
-             Just els -> foldl genStmt ( []:env, nxt, [] ) els
-             Nothing  -> ( []:env, nxt, [] )
-           nk       = max nTh nEl
-           tL       = length thC
-           eL       = length elC
-           bc       = cc
-                    ++ [ Branch regA (Rel (tL + 2)) ]
-                    ++ thC
-                    ++ [ Jump (Rel (eL + 1)) ]
-                    ++ elC
-       in (env, nk, code ++ bc)
+  If condition thenBranch maybeElseBranch ->
+    let condInstructions = compileExpr environment regA condition
+        (_, thenNextSlot, thenInstructions) = foldl generateStatement ([]:environment, nextSlot, []) thenBranch
+        (_, elseNextSlot, elseInstructions) = case maybeElseBranch of
+                                                Just elseBranch -> foldl generateStatement ([]:environment, nextSlot, []) elseBranch
+                                                Nothing        -> ([]:environment, nextSlot, [])
+        thenLength = length thenInstructions
+        elseLength = length elseInstructions
+        zeroInstructions = [ Load (ImmValue 0) regB
+                          , Compute Equal regA regB regA ]
+        branchInstructions = zeroInstructions
+                          ++ [ Branch regA (Rel (thenLength + 2)) ]
+                          ++ thenInstructions
+                          ++ [ Jump (Rel (elseLength + 1)) ]
+                          ++ elseInstructions
+    in (environment, max thenNextSlot elseNextSlot, instructions ++ condInstructions ++ branchInstructions)
 
-  -- while/fun
-  While cond body
-    -> let cc       = compileExpr env regA cond
-           (_, nBd, bdC) = foldl genStmt ( []:env, nxt, [] ) body
-           cL       = length cc
-           bL       = length bdC
-           lc       = cc
-                    ++ [ Branch regA (Rel 2), Jump (Rel (bL + 2)) ]
-                    ++ bdC
-                    ++ [ Jump (Rel (-(cL + bL + 2))) ]
-       in (env, nBd, code ++ lc)
+  While condition bodyStatements
+    -> let condInstructions = compileExpr environment regA condition
+           (_, bodyNextSlot, bodyInstructions) = foldl generateStatement ([]:environment, nextSlot, []) bodyStatements
+           condLength = length condInstructions
+           bodyLength = length bodyInstructions
+           loopInstructions = condInstructions ++ [ Branch regA (Rel 2), Jump (Rel (bodyLength + 2)) ] ++ bodyInstructions ++ [ Jump (Rel (-(condLength + bodyLength + 2))) ]
+       in (environment, bodyNextSlot, instructions ++ loopInstructions)
 
-  -- fork/join
-  ForkJoin ss
-    -> let (_:outer, nxt', fjC) = foldl genStmt ( []:env, nxt, [] ) ss
-       in (outer, nxt', code ++ fjC)
+  ForkJoin statements ->
+    let (_:outerScopes, nextSlot', forkJoinInstructions) = foldl generateStatement ([]:environment, nextSlot, []) statements
+    in (outerScopes, nextSlot', instructions ++ forkJoinInstructions)
 
-  -- lock
-  Lock _ ss
-    -> let (_:outer, nxt', lkC) = foldl genStmt ( []:env, nxt, [] ) ss
-       in (outer, nxt', code ++ lkC)
+  Lock _ statements ->
+    let (_:outerScopes, nextSlot', lockInstructions) = foldl generateStatement ([]:environment, nextSlot, []) statements
+    in (outerScopes, nextSlot', instructions ++ lockInstructions)
 
--- | Expression codegen
-type Reg = Int
-compileExpr :: Env -> Reg -> Expr -> [Instruction]
-compileExpr env tgt expr = case expr of
-  IntLit n      -> [ Load (ImmValue (fromIntegral n)) tgt ]
-  BoolLit b     -> [ Load (ImmValue (if b then 1 else 0)) tgt ]
-  StringLit s   -> error "String literal not allowed in expr context"
-  Var x         -> [ Load (DirAddr (lookupScalar x env)) tgt ]
-  ArrayRef nm i ->
-    let (b, _, _) = lookupVector nm env
-        iC     = compileExpr env regB i
-        bC     = [ Load (ImmValue b) regC ]
-        aC     = [ Compute Add regC regB regC ]
-        lC     = [ Load (IndAddr regC) tgt ]
-    in iC ++ bC ++ aC ++ lC
 
-  BinOp op l r  -> let lC = compileExpr env tgt l
-                       rC = compileExpr env regB r
-                   in lC ++ rC ++ [ Compute (toOp op) tgt regB tgt ]
-  UnOp "!" e  -> compileExpr env tgt e ++ [ Compute Xor tgt tgt tgt ]
-  _             -> error $ "Unsupported Expr: " ++ show expr
+compileExpr :: Environment -> Register -> Expr -> [Instruction]
+compileExpr = compileOr
 
--- | Operator mapping
+
+compileOr :: Environment -> Register -> Expr -> [Instruction]
+compileOr environment targetRegister expr =
+  let (first, rest) = splitOp "||" expr
+      firstCode = compileAnd environment targetRegister first
+      restCode = concat [ compileAnd environment regB e ++ [ Compute Or targetRegister regB targetRegister ] | e <- rest ]
+  in firstCode ++ restCode
+
+
+compileAnd :: Environment -> Register -> Expr -> [Instruction]
+compileAnd environment targetRegister expr =
+  let (first, rest) = splitOp "&&" expr
+      firstCode = compileEq environment targetRegister first
+      restCode = concat [ compileEq environment regB e ++ [ Compute And targetRegister regB targetRegister ] | e <- rest ]
+  in firstCode ++ restCode
+
+
+compileEq :: Environment -> Register -> Expr -> [Instruction]
+compileEq environment targetRegister expr =
+  let (first, rest)  = splitOpList [("==", Equal), ("!=", NEq)] expr
+      firstCode = compileCmp environment targetRegister first
+      restCode = concat [ compileCmp environment regB e ++ [ Compute op targetRegister regB targetRegister ]
+                       | (_, op, e) <- rest ]
+  in firstCode ++ restCode
+
+
+compileCmp :: Environment -> Register -> Expr -> [Instruction]
+compileCmp environment targetRegister expr =
+  let (first, rest) = splitOpList [("<", Lt), ("<=", LtE), (">", Gt), (">=", GtE)] expr
+      firstCode = compileAdd environment targetRegister first
+      restCode = concat [ compileAdd environment regB e ++ [ Compute op targetRegister regB targetRegister ]
+                       | (_, op, e) <- rest ]
+  in firstCode ++ restCode
+
+
+compileAdd :: Environment -> Register -> Expr -> [Instruction]
+compileAdd environment targetRegister expr =
+  let (first, rest) = splitOpList [("+", Add), ("-", Sub)] expr
+      firstCode = compileTerm environment targetRegister first
+      restCode = concat [ compileTerm environment regB e ++ [ Compute op targetRegister regB targetRegister ]
+                       | (_, op, e) <- rest ]
+  in firstCode ++ restCode
+
+
+compileTerm :: Environment -> Register -> Expr -> [Instruction]
+compileTerm environment targetRegister expr =
+  let (first, rest) = splitOp "*" expr
+      firstCode = compileFactor environment targetRegister first
+      restCode = concat [ compileFactor environment regC e ++ [ Compute Mul targetRegister regC targetRegister ]
+                       | e <- rest ]
+  in firstCode ++ restCode
+
+
+compileFactor :: Environment -> Register -> Expr -> [Instruction]
+compileFactor environment targetRegister expr = case expr of
+  IntLit n      -> [ Load (ImmValue (fromIntegral n)) targetRegister ]
+  BoolLit b     -> [ Load (ImmValue (if b then 1 else 0)) targetRegister ]
+  Var variableName -> [ Load (DirAddr (lookupScalar variableName environment)) targetRegister ]
+  ArrayRef arrayName indexExpr ->
+    let (base, _, _) = lookupVector arrayName environment
+        indexCode = compileExpr environment regB indexExpr
+        baseCode = [ Load (ImmValue base) regC ]
+        addressCode = [ Compute Add regC regB regC ]
+        loadCode = [ Load (IndAddr regC) targetRegister ]
+    in indexCode ++ baseCode ++ addressCode ++ loadCode
+  UnOp "!" e  -> compileExpr environment targetRegister e ++ [ Compute Xor targetRegister targetRegister targetRegister ]
+  _           -> error $ "Unsupported factor: " ++ show expr
+
+
+defaultSplit :: String -> Expr -> (Expr, [Expr])
+defaultSplit op (BinOp symbol left right) | symbol == op = let (left0, rest) = defaultSplit op left in (left0, rest ++ [right])
+defaultSplit _ expr = (expr, [])
+
+splitOp :: String -> Expr -> (Expr, [Expr])
+splitOp = defaultSplit
+
+splitOpList :: [(String, Operator)] -> Expr -> (Expr, [(String, Operator, Expr)])
+splitOpList operators expr = case expr of
+  BinOp symbol left right -> case lookup symbol operators of
+    Just op -> let (left0, rest) = splitOpList operators left in (left0, rest ++ [(symbol, op, right)])
+    Nothing -> (expr, [])
+  _ -> (expr, [])
+
 toOp :: String -> Operator
 toOp "+"  = Add
 toOp "-"  = Sub
@@ -187,6 +234,4 @@ toOp "<"  = Lt
 toOp "<=" = LtE
 toOp ">"  = Gt
 toOp ">=" = GtE
-toOp "&&" = And
-toOp "||" = Or
-toOp _     = error "Unknown operator"
+toOp _     = error "Unsupported in toOp"

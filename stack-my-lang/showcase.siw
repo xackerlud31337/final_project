@@ -1,0 +1,56 @@
+i x;                                                // Integer assignment
+x = 1 + 1 + 2 * 3 + 1 + 1 + 4 * 5 + 1 + 1;          // 32
+print x;
+
+am flag;                                            // Boolean assignment
+flag = (x > 30);                                    // assignment by using a bin operation
+flag = cs;                                          // Assigning a boolean literaly using false
+flag = a;                                           // Assigning a boolean literaly using true
+
+major(flag){                                        // Conditional check
+    print x;                                        // Printing x value if true
+}
+having{
+    print -1;                                       // Printing -1 if false
+}
+
+sci vec = [10, 20, 30];                             // Vector initialization
+i counter;
+counter = 0;
+i sum;
+fun (counter < 3){                                  // While loop initialization and condition
+    sum = sum + vec[counter];
+    counter = counter + 1;
+}
+print sum;
+
+i nested;
+nested = 9999;
+{
+    i nested;                                       // Nested variables are reinitialized
+    nested = 3;
+    print nested;
+}
+print nested;
+
+sci msg1 = "Hello ";
+sci msg2 = "World!";
+sci msg = "";
+
+i len1;
+len1 = 6;                                           // length of "Hello "
+i idx1;
+idx1 = 0;
+fun (idx1 < len1) {
+    print msg1[idx1];
+    idx1 = idx1 + 1;
+}
+
+i len2;
+len2 = 6;                                           // length of "World!"
+i idx2;
+idx2 = 0;
+fun (idx2 < len2) {
+    print msg2[idx2];
+    idx2 = idx2 + 1;
+}
