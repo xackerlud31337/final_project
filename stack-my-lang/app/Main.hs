@@ -30,12 +30,12 @@ runFile path = do
   case parseMyLang src of
     Left err -> putStrLn ("Error parsing " ++ path ++ ": " ++ err)
     Right ast -> do
-      let progs = compileSource src  -- Use compileSource for multi-Sprockell support
+      let progs = compileSource src
       
       -- Show compilation info
       putStrLn $ "\nCompiled " ++ path ++ " into " ++ show (length progs) ++ " Sprockell programs"
       
-      -- Show first few instructions of each program for debugging
+      -- Show first few instructions for debugging
       mapM_ (\(i, prog) -> do
         putStrLn $ "\nSprockell " ++ show i ++ " (" ++ show (length prog) ++ " instructions):"
         mapM_ (\(j, instr) -> putStrLn $ "  " ++ show j ++ ": " ++ show instr) (zip [0..] (take 15 prog))
