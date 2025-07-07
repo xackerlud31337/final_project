@@ -10,11 +10,10 @@ import qualified Text.Parsec.Expr as Ex
 import Control.Arrow (left)
 import Data.Functor.Identity (Identity)
 
--- | Types in the language
 data Type = TypeInt | TypeBool
   deriving (Show, Eq)
 
--- | Expression AST
+-- Expression AST
 data Expr
   = IntLit Integer
   | BoolLit Bool
@@ -25,7 +24,7 @@ data Expr
   | UnOp  String Expr
   deriving (Show, Eq)
 
--- | Statement AST
+-- Statement AST
 data Stmt
   = Decl   Type String
   | Assign String Expr
@@ -228,6 +227,5 @@ block = Block <$> braces (many stmt)
 program :: Parser [Stmt]
 program = whiteSpace >> many stmt <* eof
 
--- | The only function exposed
 parseMyLang :: String -> Either String [Stmt]
 parseMyLang = left show . parse program "<stdin>"
