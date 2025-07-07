@@ -1,0 +1,8 @@
+i shared;
+shared = 100;
+
+fork {
+  shared = shared + 1;
+} join;
+
+print shared;

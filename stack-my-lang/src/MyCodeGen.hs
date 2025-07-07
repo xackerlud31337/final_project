@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 module MyCodeGen
   ( compileSource
   , compileAST
@@ -9,229 +10,522 @@ import Data.Char (ord)
 import MyParser (parseMyLang, Stmt(..), Expr(..))
 import Sprockell
 
+-- | Types for variables and environment
 
-data ElementType = ElementInt | ElementChar deriving (Eq, Show)
-data VariableInfo
-  = ScalarVariable Int
-  | VectorVariable Int Int ElementType
+data ElementType  = ElementInt | ElementChar deriving (Eq, Show)
+data VariableInfo = ScalarVariable Int Bool  -- Int: slot, Bool: isShared
+                  | VectorVariable Int Int ElementType
+                  deriving (Show)
 
-type Scope = [(String, VariableInfo)]
+type Scope       = [(String, VariableInfo)]
 type Environment = [Scope]
-type MemorySlot = Int
-type Register = Int
+type MemorySlot  = Int
+type Register    = Int
 
+-- Debug helper
+debugEnv :: String -> Environment -> String
+debugEnv label env = label ++ ": " ++ show (map (map fst) env)
 
-compileSource :: String -> [Instruction]
-compileSource source =
-  case parseMyLang source of
-    Left parseError  -> error $ show parseError
-    Right ast        -> compileAST ast
+-- | Compile a source string into Sprockell programs (main + children)
+compileSource :: String -> [[Instruction]]
+compileSource src =
+  case parseMyLang src of
+    Left err  -> error $ show err
+    Right ast -> 
+      -- Check if there's concurrency before deciding compilation strategy
+      let concurrent = hasConcurrency ast
+      in if concurrent
+         then compileASTConcur ast
+         else [compileSingleThread ast]  -- Return as a single-element list
+  where
+    hasConcurrency [] = False
+    hasConcurrency (ForkJoin _ : _) = True
+    hasConcurrency (Block blkStmts : rest) = hasConcurrency blkStmts || hasConcurrency rest
+    hasConcurrency (_:rest) = hasConcurrency rest
 
-
+-- | Single-thread entry (for testing)
 compileAST :: [Stmt] -> [Instruction]
-compileAST statements =
-  let initialEnvironment = [ [] ]
-      initialMemorySlot = 0
-      (_, _, instructions) = foldl generateStatement (initialEnvironment, initialMemorySlot, []) statements
-  in instructions ++ [EndProg]
+compileAST stmts = 
+  -- Check if there's any concurrency in the program
+  if hasConcurrency stmts
+  then case compileASTConcur stmts of
+         (m:_) -> m
+         []    -> [EndProg]
+  else compileSingleThread stmts
+  where
+    hasConcurrency [] = False
+    hasConcurrency (ForkJoin _ : _) = True
+    hasConcurrency (Block blkStmts : rest) = hasConcurrency blkStmts || hasConcurrency rest
+    hasConcurrency (_:rest) = hasConcurrency rest
 
+-- | Compile single-threaded program (no concurrency setup)
+compileSingleThread :: [Stmt] -> [Instruction]
+compileSingleThread stmts =
+  let initialEnv = [[]]  -- Single empty scope, no special variables
+      (_, _, instrs) = foldl (\(e,s,c) st -> generateStatement (e,s,c) False st)  -- False = not main thread
+                              (initialEnv, 0, []) 
+                              stmts
+  in instrs ++ [EndProg]
 
-lookupScalar :: String -> Environment -> Int
-lookupScalar variableName [] = error $ "Not found or not scalar: " ++ variableName
-lookupScalar variableName (scope:outerScopes) =
-  case lookup variableName scope of
-    Just (ScalarVariable slot) -> slot
-    _                         -> lookupScalar variableName outerScopes
+-- | Concurrent compilation with join counter in slot 0 and mutex in slot 1
+compileASTConcur :: [Stmt] -> [[Instruction]]
+compileASTConcur stmts =
+  let
+    -- Shared memory slots
+    joinSlot  = 0  -- Counter for completed threads
+    mutexSlot = 1  -- Mutex for join counter
+    nextFree  = 2
 
+    -- Initial setup
+    initSetup =
+      [ Load  (ImmValue 0) regA
+      , WriteInstr regA (DirAddr joinSlot)    -- Initialize join counter
+      , WriteInstr regA (DirAddr mutexSlot)   -- Initialize mutex (unlocked)
+      ]
 
-lookupVector :: String -> Environment -> (Int, Int, ElementType)
-lookupVector variableName [] = error $ "Not found or not vector: " ++ variableName
-lookupVector variableName (scope:outerScopes) =
-  case lookup variableName scope of
-    Just (VectorVariable base length elementType) -> (base, length, elementType)
-    _                                            -> lookupVector variableName outerScopes
+    -- Build initial environment with special variables
+    initialEnv = [[ ("joinCounter", ScalarVariable joinSlot True)
+                  , ("joinMutex",   ScalarVariable mutexSlot True)
+                  ]]
+    
+    -- Process all statements, collecting thread bodies
+    (envAfter, slotAfter, mainBody) = processStatements initialEnv nextFree [] stmts
 
+    -- Extract all thread bodies
+    (mainCode, allThreadBodies) = extractThreads mainBody
 
-generateStatement :: (Environment, MemorySlot, [Instruction]) -> Stmt -> (Environment, MemorySlot, [Instruction])
-generateStatement (environment, nextSlot, instructions) statement = case statement of
-  Decl _ variableName
-    | variableName `elem` map fst (head environment)
-      -> error $ "Variable already declared: " ++ variableName
+    -- Main program
+    mainProg = initSetup ++ mainCode ++ [EndProg]
+
+    -- Child programs with proper initialization
+    childProgs = [ body ++
+        [ -- Atomic increment of join counter
+          Load      (ImmValue 1)         regB
+        , TestAndSet (DirAddr mutexSlot) -- Lock mutex
+        , Receive regA                   -- Get old mutex value
+        , Compute   Equal           regA regB regA
+        , Branch    regA           (Rel 2)
+        , Jump      (Rel (-5))
+          -- Critical section: increment counter
+        , ReadInstr (DirAddr joinSlot)
+        , Receive   regB
+        , Load      (ImmValue 1)         regC
+        , Compute   Add            regB regC regB
+        , WriteInstr regB           (DirAddr joinSlot)
+          -- Unlock mutex
+        , Load      (ImmValue 0)         regA
+        , WriteInstr regA           (DirAddr mutexSlot)
+        , EndProg
+        ]
+      | body <- allThreadBodies
+      ]
+  in mainProg : childProgs
+
+-- Process statements, handling fork-join specially
+processStatements :: Environment -> MemorySlot -> [Either [Instruction] [[Instruction]]] -> [Stmt] -> (Environment, MemorySlot, [Either [Instruction] [[Instruction]]])
+processStatements env slot acc [] = (env, slot, reverse acc)
+processStatements env slot acc (stmt:rest) = case stmt of
+  ForkJoin stmts ->
+    -- Generate thread bodies
+    let bodies = groupForkStatements env 0 stmts
+        -- Generate wait code
+        numThreads = length bodies
+        waitCode = if numThreads > 0
+                   then [ -- Wait for all children to complete
+                          Load    (ImmValue numThreads) regB  -- Expected count
+                        , ReadInstr (DirAddr 0)              -- Read join counter (slot 0)
+                        , Receive regA                       -- Current count
+                        , Compute Equal regA regB regA      -- Check if all done
+                        , Branch  regA (Rel 2)              -- If done, skip jump
+                        , Jump    (Rel (-4))                -- Loop back
+                        ]
+                   else []
+    in processStatements env slot (Right bodies : Left waitCode : acc) rest
+  _ ->
+    let (env', slot', is) = generateStatement (env, slot, []) True stmt
+    in processStatements env' slot' (Left is : acc) rest
+
+-- Extract threads from the mixed list
+extractThreads :: [Either [Instruction] [[Instruction]]] -> ([Instruction], [[Instruction]])
+extractThreads [] = ([], [])
+extractThreads (Left instrs : rest) = 
+  let (mainCode, threads) = extractThreads rest
+  in (instrs ++ mainCode, threads)
+extractThreads (Right bodies : rest) =
+  let (mainCode, threads) = extractThreads rest
+  in (mainCode, bodies ++ threads)
+
+-- | Top-level: separate ForkJoin bodies and track where to insert wait code
+generateTopLevel
+  :: (Environment, MemorySlot, [Instruction], [[Instruction]])
+  -> Stmt
+  -> (Environment, MemorySlot, [Instruction], [[Instruction]])
+generateTopLevel (env, slot, mainI, threads) stmt = case stmt of
+  ForkJoin stmts ->
+    -- Generate thread bodies
+    let bodies = groupForkStatements env 0 stmts
+        -- Generate wait code for these threads
+        numThreads = length bodies
+        waitCode = if numThreads > 0
+                   then [ -- Wait for all children to complete
+                          Load    (ImmValue numThreads) regB  -- Expected count
+                        , ReadInstr (DirAddr 0)              -- Read join counter (slot 0)
+                        , Receive regA                       -- Current count
+                        , Compute Equal regA regB regA      -- Check if all done
+                        , Branch  regA (Rel 2)              -- If done, skip jump
+                        , Jump    (Rel (-4))                -- Loop back
+                        ]
+                   else []
+    in (env, slot, mainI ++ waitCode, threads ++ bodies)
+  _ ->
+    let (env', slot', is) = generateStatement (env, slot, []) True stmt
+    in (env', slot', mainI ++ is, threads)
+
+-- | Transform environment for child threads - all parent vars become shared
+makeChildEnvironment :: Environment -> Environment
+makeChildEnvironment env = map makeShared env
+  where
+    makeShared scope = [(name, makeVarShared var) | (name, var) <- scope]
+    makeVarShared (ScalarVariable slot _) = ScalarVariable slot True
+    makeVarShared v = v  -- Vectors remain unchanged
+
+-- | Group fork statements into separate threads
+groupForkStatements :: Environment -> MemorySlot -> [Stmt] -> [[Instruction]]
+groupForkStatements parentEnv _ stmts =  -- Ignore the slot parameter
+  -- Extract thread groups from the statements
+  let threadGroups = extractThreadGroups stmts
+      -- Transform parent environment - all vars become shared for child threads
+      childEnv = makeChildEnvironment parentEnv
+      -- Add empty local scope for each child thread
+      threadEnv = [] : childEnv
+      -- Compile each thread group
+      compileThread statements = 
+        let (_, _, code) = foldl 
+              (\(e, s, c) stmt -> generateStatement (e, s, c) False stmt)
+              (threadEnv, 0, [])  -- Use transformed environment with local scope
+              statements
+        in code
+  in map compileThread threadGroups
+
+-- | Extract thread groups from fork body
+extractThreadGroups :: [Stmt] -> [[Stmt]]
+extractThreadGroups stmts = 
+  let groups = groupStatements stmts []
+  in filter (not . null) groups  -- Remove empty groups
+  where
+    -- Group statements that belong together
+    groupStatements [] acc = reverse acc
+    groupStatements (s:ss) acc = case s of
+      -- Pattern: Declaration followed by assignment and while loop
+      Decl t v -> case ss of
+        (Assign v' init : rest) | v == v' -> 
+          case rest of
+            (w@(While _ _) : rest') -> 
+              groupStatements rest' ([Decl t v, Assign v' init, w] : acc)
+            _ -> groupStatements rest ([Decl t v, Assign v' init] : acc)
+        _ -> groupStatements ss ([s] : acc)
+      -- Pattern: Assignment followed by while loop
+      Assign v init -> case ss of
+        (w@(While _ _) : rest) -> 
+          groupStatements rest ([Assign v init, w] : acc)
+        _ -> groupStatements ss ([s] : acc)
+      -- Standalone while loops or other statements
+      _ -> groupStatements ss ([s] : acc)
+
+-- | Generate code & update env and slot
+-- Now takes a Bool indicating if we're in the main thread (True) or child thread (False)
+generateStatement
+  :: (Environment, MemorySlot, [Instruction])
+  -> Bool  -- isMainThread
+  -> Stmt
+  -> (Environment, MemorySlot, [Instruction])
+generateStatement ([], _, _) _ stmt = error "Empty environment"
+generateStatement (env@(current:rest), nextSlot, instrs) isMainThread stmt = 
+  let hasConcurrencyInProgram = any (\scope -> "joinCounter" `elem` map fst scope) env
+  in case stmt of
+  Decl _ name
+    | name `elem` map fst current
+      -> error $ "Variable already declared: " ++ name
     | otherwise
       -> let slot = nextSlot
-             initInstructions = [ Load (ImmValue 0) regA, Store regA (DirAddr slot) ]
-             newScope = (variableName, ScalarVariable slot) : head environment
-         in (newScope : tail environment, slot + 1, instructions ++ initInstructions)
+             -- Only use shared memory if we're in a concurrent program's main thread
+             isShared = isMainThread && hasConcurrencyInProgram
+             code = [ Load (ImmValue 0) regA ] ++
+                    if isShared 
+                    then [ WriteInstr regA (DirAddr slot) ]
+                    else [ Store regA (DirAddr slot) ]
+             newScope = (name, ScalarVariable slot isShared) : current
+         in (newScope:rest, slot+1, instrs ++ code)
 
-  DeclStr variableName stringValue
-    | variableName `elem` map fst (head environment)
-      -> error $ "Variable already declared: " ++ variableName
+  Assign name expr
+    -> let varInfo = lookupVar name env
+           code = case varInfo of
+             Just (slot, isShared) ->
+               compileExpr env regA expr ++ 
+               if isShared
+               then [ WriteInstr regA (DirAddr slot) ]
+               else [ Store regA (DirAddr slot) ]
+             Nothing -> error $ "Variable not found: " ++ name ++ " in env: " ++ debugEnv "Assign" env
+       in (env, nextSlot, instrs ++ code)
+
+  Print expr
+    -> let code = compileExpr env regA expr
+           dev = case expr of 
+             StringLit _ -> charIO
+             ArrayRef{} -> charIO
+             _ -> numberIO
+       in (env, nextSlot, instrs ++ code ++ [ WriteInstr regA dev ])
+
+  Block stmts
+    -> let -- Create new scope for the block
+           newEnv = [] : env  -- Add empty scope on top
+           (env', slot', codes) = foldl (\(e,s,c) st -> generateStatement (e,s,c) isMainThread st) 
+                                        (newEnv, nextSlot, []) 
+                                        stmts
+           -- Pop the block scope, keeping any slot advances
+           envAfterBlock = case env' of
+             (_:rest) -> rest
+             [] -> error "Environment corruption in block"
+       in (envAfterBlock, slot', instrs ++ codes)
+
+  If cond thenB mayElse
+    -> let condCode = compileExpr env regA cond
+           ( _, slotT, thenCode) = foldl (\(e,s,c) st -> generateStatement (e,s,c) isMainThread st) (env, nextSlot, []) thenB
+           ( _, slotE, elseCode) = case mayElse of
+                                     Just es -> foldl (\(e,s,c) st -> generateStatement (e,s,c) isMainThread st) (env, nextSlot, []) es
+                                     Nothing -> (env, nextSlot, [])
+           lenT = length thenCode; lenE = length elseCode
+           branch = [ Load (ImmValue 0) regB
+                    , Compute Equal regA regB regA
+                    , Branch regA (Rel (lenT + 2)) ]
+                    ++ thenCode ++ [ Jump (Rel (lenE + 1)) ] ++ elseCode
+           nextSlot' = max slotT slotE
+       in (env, nextSlot', instrs ++ condCode ++ branch)
+
+  While cond body
+    -> let condCode = compileExpr env regA cond
+           (_, slotB, bodyCode) = foldl (\(e,s,c) st -> generateStatement (e,s,c) isMainThread st) (env, nextSlot, []) body
+           lC = length condCode; lB = length bodyCode
+           loop = condCode ++ [ Branch regA (Rel 2), Jump (Rel (lB + 2)) ]
+                  ++ bodyCode ++ [ Jump (Rel (-(lC + lB + 2))) ]
+       in (env, slotB, instrs ++ loop)
+
+  ForkJoin _ -> error "ForkJoin only at top-level"
+
+  Lock name stmts
+    -> let varInfo = lookupVar name env
+           (lockCode, unlockCode) = case varInfo of
+             Just (slot, _) ->  -- Lock variables are always in shared memory
+               let -- Atomic lock via TestAndSet
+                   lock = [ Load      (ImmValue 1)         regB
+                          , TestAndSet (DirAddr slot)
+                          , Receive   regA
+                          , Compute   Equal           regA regB regA
+                          , Branch    regA           (Rel 2)
+                          , Jump      (Rel (-5))
+                          ]
+                   unlock = [ Load (ImmValue 0) regA
+                            , WriteInstr regA (DirAddr slot) ]
+               in (lock, unlock)
+             Nothing -> error $ "Lock variable not found: " ++ name ++ " in env: " ++ debugEnv "Lock" env
+           -- Compile body with same environment and thread context
+           (_, slot', bodyCode) = foldl (\(e,s,c) st -> generateStatement (e,s,c) isMainThread st) 
+                                        (env, nextSlot, []) 
+                                        stmts
+       in (env, slot', instrs ++ lockCode ++ bodyCode ++ unlockCode)
+
+  DeclStr name s
+    | name `elem` map fst current
+      -> error $ "Variable already declared: " ++ name
     | otherwise
-      -> let strLength = length stringValue
-             baseSlot = nextSlot
-             charInstructions = concat [ [ Load (ImmValue (ord char)) regA
-                                         , Store regA (DirAddr (baseSlot + i)) ]
-                                       | (i, char) <- zip [0..] stringValue ]
-             terminatorInstructions = [ Load (ImmValue 0) regA, Store regA (DirAddr (baseSlot + strLength)) ]
-             newScope = (variableName, VectorVariable baseSlot (strLength + 1) ElementChar) : head environment
-         in (newScope : tail environment, baseSlot + strLength + 1, instructions ++ charInstructions ++ terminatorInstructions)
+      -> let base = nextSlot
+             -- Only use shared memory if we're in a concurrent program's main thread
+             isShared = isMainThread && hasConcurrencyInProgram
+             storeChars = concat [ [ Load (ImmValue (ord c)) regA ] ++
+                                   if isShared
+                                   then [ WriteInstr regA (DirAddr (base+i)) ]
+                                   else [ Store regA (DirAddr (base+i)) ]
+                                 | (i,c) <- zip [0..] s ]
+             terminator = [ Load (ImmValue 0) regA ] ++
+                         if isShared
+                         then [ WriteInstr regA (DirAddr (base + length s)) ]
+                         else [ Store regA (DirAddr (base + length s)) ]
+             newScope = (name, VectorVariable base (length s + 1) ElementChar) : current
+         in (newScope:rest, base + length s + 1, instrs ++ storeChars ++ terminator)
 
-  DeclVec variableName elements
-    | variableName `elem` map fst (head environment)
-      -> error $ "Variable already declared: " ++ variableName
+  DeclVec name es
+    | name `elem` map fst current
+      -> error $ "Variable already declared: " ++ name
     | otherwise
-      -> let vecLength = length elements
-             baseSlot = nextSlot
-             storeInstructions = concat [ compileExpr environment regA expr ++ [ Store regA (DirAddr (baseSlot + i)) ]
-                                       | (i, expr) <- zip [0..] elements ]
-             newScope = (variableName, VectorVariable baseSlot vecLength ElementInt) : head environment
-         in (newScope : tail environment, baseSlot + vecLength, instructions ++ storeInstructions)
+      -> let base = nextSlot
+             -- Only use shared memory if we're in a concurrent program's main thread
+             isShared = isMainThread && hasConcurrencyInProgram
+             stores = concat [ compileExpr env regA e ++ 
+                              if isShared
+                              then [ WriteInstr regA (DirAddr (base+i)) ]
+                              else [ Store regA (DirAddr (base+i)) ]
+                             | (i,e) <- zip [0..] es ]
+             newScope = (name, VectorVariable base (length es) ElementInt) : current
+         in (newScope:rest, base + length es, instrs ++ stores)
 
-  Assign variableName expr
-    -> let slot = lookupScalar variableName environment
-           exprInstructions = compileExpr environment regA expr
-       in (environment, nextSlot, instructions ++ exprInstructions ++ [ Store regA (DirAddr slot) ])
-
-  Print expr ->
-    let exprInstructions = compileExpr environment regA expr
-        device = case expr of
-          StringLit _  -> charIO
-          ArrayRef _ _ -> charIO
-          _            -> numberIO
-    in (environment, nextSlot, instructions ++ exprInstructions ++ [ WriteInstr regA device ])
-
-  Block statements ->
-    let (_:outerScopes, nextSlot', blockInstructions) = foldl generateStatement ([]:environment, nextSlot, []) statements
-    in (outerScopes, nextSlot', instructions ++ blockInstructions)
-
-  If condition thenBranch maybeElseBranch ->
-    let condInstructions = compileExpr environment regA condition
-        (_, thenNextSlot, thenInstructions) = foldl generateStatement ([]:environment, nextSlot, []) thenBranch
-        (_, elseNextSlot, elseInstructions) = case maybeElseBranch of
-                                                Just elseBranch -> foldl generateStatement ([]:environment, nextSlot, []) elseBranch
-                                                Nothing        -> ([]:environment, nextSlot, [])
-        thenLength = length thenInstructions
-        elseLength = length elseInstructions
-        zeroInstructions = [ Load (ImmValue 0) regB
-                          , Compute Equal regA regB regA ]
-        branchInstructions = zeroInstructions
-                          ++ [ Branch regA (Rel (thenLength + 2)) ]
-                          ++ thenInstructions
-                          ++ [ Jump (Rel (elseLength + 1)) ]
-                          ++ elseInstructions
-    in (environment, max thenNextSlot elseNextSlot, instructions ++ condInstructions ++ branchInstructions)
-
-  While condition bodyStatements
-    -> let condInstructions = compileExpr environment regA condition
-           (_, bodyNextSlot, bodyInstructions) = foldl generateStatement ([]:environment, nextSlot, []) bodyStatements
-           condLength = length condInstructions
-           bodyLength = length bodyInstructions
-           loopInstructions = condInstructions ++ [ Branch regA (Rel 2), Jump (Rel (bodyLength + 2)) ] ++ bodyInstructions ++ [ Jump (Rel (-(condLength + bodyLength + 2))) ]
-       in (environment, bodyNextSlot, instructions ++ loopInstructions)
-
-  ForkJoin statements ->
-    let (_:outerScopes, nextSlot', forkJoinInstructions) = foldl generateStatement ([]:environment, nextSlot, []) statements
-    in (outerScopes, nextSlot', instructions ++ forkJoinInstructions)
-
-  Lock _ statements ->
-    let (_:outerScopes, nextSlot', lockInstructions) = foldl generateStatement ([]:environment, nextSlot, []) statements
-    in (outerScopes, nextSlot', instructions ++ lockInstructions)
-
-
+-- | Expression compilation with better register management
 compileExpr :: Environment -> Register -> Expr -> [Instruction]
 compileExpr = compileOr
 
-
 compileOr :: Environment -> Register -> Expr -> [Instruction]
-compileOr environment targetRegister expr =
-  let (first, rest) = splitOp "||" expr
-      firstCode = compileAnd environment targetRegister first
-      restCode = concat [ compileAnd environment regB e ++ [ Compute Or targetRegister regB targetRegister ] | e <- rest ]
-  in firstCode ++ restCode
-
+compileOr env tgt = \case
+  BinOp "||" l r -> 
+    let lCode = compileAnd env tgt l
+        rCode = compileAnd env regB r
+    in lCode ++ rCode ++ [ Compute Or tgt regB tgt ]
+  e -> compileAnd env tgt e
 
 compileAnd :: Environment -> Register -> Expr -> [Instruction]
-compileAnd environment targetRegister expr =
-  let (first, rest) = splitOp "&&" expr
-      firstCode = compileEq environment targetRegister first
-      restCode = concat [ compileEq environment regB e ++ [ Compute And targetRegister regB targetRegister ] | e <- rest ]
-  in firstCode ++ restCode
-
-
-compileEq :: Environment -> Register -> Expr -> [Instruction]
-compileEq environment targetRegister expr =
-  let (first, rest)  = splitOpList [("==", Equal), ("!=", NEq)] expr
-      firstCode = compileCmp environment targetRegister first
-      restCode = concat [ compileCmp environment regB e ++ [ Compute op targetRegister regB targetRegister ]
-                       | (_, op, e) <- rest ]
-  in firstCode ++ restCode
-
+compileAnd env tgt = \case
+  BinOp "&&" l r -> 
+    let lCode = compileCmp env tgt l
+        rCode = compileCmp env regB r
+    in lCode ++ rCode ++ [ Compute And tgt regB tgt ]
+  e -> compileCmp env tgt e
 
 compileCmp :: Environment -> Register -> Expr -> [Instruction]
-compileCmp environment targetRegister expr =
-  let (first, rest) = splitOpList [("<", Lt), ("<=", LtE), (">", Gt), (">=", GtE)] expr
-      firstCode = compileAdd environment targetRegister first
-      restCode = concat [ compileAdd environment regB e ++ [ Compute op targetRegister regB targetRegister ]
-                       | (_, op, e) <- rest ]
-  in firstCode ++ restCode
-
+compileCmp env tgt = \case
+  BinOp "==" l r -> 
+    let lCode = compileAdd env tgt l
+        rCode = compileAdd env regC r  -- Use regC instead of regB
+    in lCode ++ rCode ++ [ Compute Equal tgt regC tgt ]
+  BinOp "!=" l r -> 
+    let lCode = compileAdd env tgt l
+        rCode = compileAdd env regC r
+    in lCode ++ rCode ++ [ Compute NEq tgt regC tgt ]
+  BinOp "<"  l r -> 
+    let lCode = compileAdd env tgt l
+        rCode = compileAdd env regC r
+    in lCode ++ rCode ++ [ Compute Lt tgt regC tgt ]
+  BinOp ">=" l r -> 
+    let lCode = compileAdd env tgt l
+        rCode = compileAdd env regC r
+    in lCode ++ rCode ++ [ Compute GtE tgt regC tgt ]
+  BinOp "<=" l r -> 
+    let lCode = compileAdd env tgt l
+        rCode = compileAdd env regC r
+    in lCode ++ rCode ++ [ Compute LtE tgt regC tgt ]
+  BinOp ">"  l r -> 
+    let lCode = compileAdd env tgt l
+        rCode = compileAdd env regC r
+    in lCode ++ rCode ++ [ Compute Gt tgt regC tgt ]
+  e -> compileAdd env tgt e
 
 compileAdd :: Environment -> Register -> Expr -> [Instruction]
-compileAdd environment targetRegister expr =
-  let (first, rest) = splitOpList [("+", Add), ("-", Sub)] expr
-      firstCode = compileTerm environment targetRegister first
-      restCode = concat [ compileTerm environment regB e ++ [ Compute op targetRegister regB targetRegister ]
-                       | (_, op, e) <- rest ]
-  in firstCode ++ restCode
-
+compileAdd env tgt = \case
+  BinOp "+" l r -> 
+    -- For complex right operands, use stack to preserve left value
+    let lCode = compileTerm env tgt l  -- Compile left to target
+        -- Push left value to stack to preserve it
+        pushLeft = [ Push tgt ]
+        -- Compile right to target (can safely use all registers now)
+        rCode = compileTerm env tgt r
+        -- Pop left value and perform addition
+        popAndAdd = [ Pop regB  -- Pop left value to regB
+                    , Compute Add regB tgt tgt ]  -- Add: left + right -> target
+    in lCode ++ pushLeft ++ rCode ++ popAndAdd
+  BinOp "-" l r -> 
+    -- Similar approach for subtraction
+    let lCode = compileTerm env tgt l
+        pushLeft = [ Push tgt ]
+        rCode = compileTerm env tgt r
+        popAndSub = [ Pop regB
+                    , Compute Sub regB tgt tgt ]
+    in lCode ++ pushLeft ++ rCode ++ popAndSub
+  e -> compileTerm env tgt e
 
 compileTerm :: Environment -> Register -> Expr -> [Instruction]
-compileTerm environment targetRegister expr =
-  let (first, rest) = splitOp "*" expr
-      firstCode = compileFactor environment targetRegister first
-      restCode = concat [ compileFactor environment regC e ++ [ Compute Mul targetRegister regC targetRegister ]
-                       | e <- rest ]
-  in firstCode ++ restCode
-
+compileTerm env tgt = \case
+  BinOp "*" l r -> 
+    -- For multiplication, also use stack
+    let lCode = compileFactor env tgt l
+        pushLeft = [ Push tgt ]
+        rCode = compileFactor env tgt r
+        popAndMul = [ Pop regB
+                    , Compute Mul regB tgt tgt ]
+    in lCode ++ pushLeft ++ rCode ++ popAndMul
+  e -> compileFactor env tgt e
 
 compileFactor :: Environment -> Register -> Expr -> [Instruction]
-compileFactor environment targetRegister expr = case expr of
-  IntLit n      -> [ Load (ImmValue (fromIntegral n)) targetRegister ]
-  BoolLit b     -> [ Load (ImmValue (if b then 1 else 0)) targetRegister ]
-  Var variableName -> [ Load (DirAddr (lookupScalar variableName environment)) targetRegister ]
-  ArrayRef arrayName indexExpr ->
-    let (base, _, _) = lookupVector arrayName environment
-        indexCode = compileExpr environment regB indexExpr
-        baseCode = [ Load (ImmValue base) regC ]
-        addressCode = [ Compute Add regC regB regC ]
-        loadCode = [ Load (IndAddr regC) targetRegister ]
-    in indexCode ++ baseCode ++ addressCode ++ loadCode
-  UnOp "!" e  -> compileExpr environment targetRegister e ++ [ Compute Xor targetRegister targetRegister targetRegister ]
-  _           -> error $ "Unsupported factor: " ++ show expr
+compileFactor env tgt = \case
+  IntLit n      -> [ Load (ImmValue (fromIntegral n)) tgt ]
+  BoolLit b     -> [ Load (ImmValue (if b then 1 else 0)) tgt ]
+  Var v         -> 
+    -- Special handling for boolean keywords
+    case v of
+      "true"  -> [ Load (ImmValue 1) tgt ]
+      "false" -> [ Load (ImmValue 0) tgt ]
+      "a"     -> [ Load (ImmValue 1) tgt ]  -- true
+      "cs"    -> [ Load (ImmValue 0) tgt ]  -- false
+      _ -> case lookupVar v env of
+             Just (slot, isShared) ->
+               if isShared
+               then [ ReadInstr (DirAddr slot)
+                    , Receive tgt ]
+               else [ Load (DirAddr slot) tgt ]
+             Nothing -> error $ "Variable not found: " ++ v ++ " in env: " ++ debugEnv "Var" env
+  ArrayRef a ix ->
+    let -- Look up the vector in the environment
+        (base, len, typ, isShared) = lookupVectorFull a env
+        -- Compute index
+        idxCode = compileExpr env regA ix
+        -- Compute address: base + index
+        addrCalc = [ Load (ImmValue base) regB
+                   , Compute Add regB regA regA ]
+        -- Load from computed address based on whether it's shared
+        loadCode = if isShared
+                   then [ ReadInstr (IndAddr regA)
+                        , Receive tgt ]
+                   else [ Load (IndAddr regA) tgt ]
+    in idxCode ++ addrCalc ++ loadCode
+  UnOp "!" e    -> 
+    let eCode = compileExpr env tgt e
+    in eCode ++ [ Compute Equal tgt reg0 tgt ]
+  StringLit _ -> error "String literals cannot be used as values"
+  -- Handle any other unary operators
+  UnOp op _ -> error $ "Unsupported unary operator: " ++ op
+  -- Binary operators in parentheses - pass back to expression compiler
+  e@(BinOp _ _ _) -> compileExpr env tgt e
 
+-- | Helper to lookup variable through all scopes
+lookupVar :: String -> Environment -> Maybe (Int, Bool)
+lookupVar n [] = Nothing
+lookupVar n (scope:rest) = 
+  case lookup n scope of
+    Just (ScalarVariable i shared) -> Just (i, shared)
+    Just _ -> Nothing  -- Not a scalar
+    Nothing -> lookupVar n rest  -- Look in parent scopes
 
-defaultSplit :: String -> Expr -> (Expr, [Expr])
-defaultSplit op (BinOp symbol left right) | symbol == op = let (left0, rest) = defaultSplit op left in (left0, rest ++ [right])
-defaultSplit _ expr = (expr, [])
+-- | Lookup helpers - search through all scopes
+lookupScalar :: String -> Environment -> (Int, Bool)  -- (slot, isShared)
+lookupScalar n env = 
+  case lookupVar n env of
+    Just info -> info
+    Nothing -> error $ "Variable not found: " ++ n
 
-splitOp :: String -> Expr -> (Expr, [Expr])
-splitOp = defaultSplit
+lookupVector :: String -> Environment -> (Int, Int, ElementType)
+lookupVector n [] = error $ "Variable not found: " ++ n
+lookupVector n (scope:rest) = 
+  case lookup n scope of
+    Just (VectorVariable b l t) -> (b, l, t)
+    Just _ -> error $ "Not a vector: " ++ n
+    Nothing -> lookupVector n rest
 
-splitOpList :: [(String, Operator)] -> Expr -> (Expr, [(String, Operator, Expr)])
-splitOpList operators expr = case expr of
-  BinOp symbol left right -> case lookup symbol operators of
-    Just op -> let (left0, rest) = splitOpList operators left in (left0, rest ++ [(symbol, op, right)])
-    Nothing -> (expr, [])
-  _ -> (expr, [])
-
-toOp :: String -> Operator
-toOp "+"  = Add
-toOp "-"  = Sub
-toOp "*"  = Mul
-toOp "==" = Equal
-toOp "!=" = NEq
-toOp "<"  = Lt
-toOp "<=" = LtE
-toOp ">"  = Gt
-toOp ">=" = GtE
-toOp _     = error "Unsupported in toOp"
+-- | Lookup vector with sharing info
+lookupVectorFull :: String -> Environment -> (Int, Int, ElementType, Bool)
+lookupVectorFull n env = 
+  let hasConcurrency = any (\scope -> "joinCounter" `elem` map fst scope) env
+      helper [] = error $ "Variable not found: " ++ n
+      helper (scope:rest) = 
+        case lookup n scope of
+          Just (VectorVariable b l t) -> 
+            -- Vectors are shared only in concurrent programs
+            (b, l, t, hasConcurrency)
+          Just _ -> error $ "Not a vector: " ++ n
+          Nothing -> helper rest
+  in helper env

@@ -1,8 +1,12 @@
+i bank;
+bank = 0;
+
 i account;
 account = 1000;
 
 fork {
-  i t1; t1 = 0;
+  i t1;
+  t1 = 0;
   fun (t1 < 3) {
     lock bank {
       account = account + 200;
@@ -10,7 +14,8 @@ fork {
     t1 = t1 + 1;
   }
 
-  i t2; t2 = 0;
+  i t2;
+  t2 = 0;
   fun (t2 < 4) {
     lock bank {
       account = account + 150;
@@ -18,7 +23,8 @@ fork {
     t2 = t2 + 1;
   }
 
-  i t3; t3 = 0;
+  i t3;
+  t3 = 0;
   fun (t3 < 5) {
     lock bank {
       account = account - 50;
@@ -26,7 +32,8 @@ fork {
     t3 = t3 + 1;
   }
 
-  i t4; t4 = 0;
+  i t4;
+  t4 = 0;
   fun (t4 < 2) {
     lock bank {
       account = account - 120;
@@ -34,6 +41,5 @@ fork {
     t4 = t4 + 1;
   }
 } join;
-
 
 print account;

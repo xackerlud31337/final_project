@@ -1,0 +1,15 @@
+i x;
+x = 1 + 1;
+print x;   // Should be 2
+
+i y;
+y = 1 + 1 + 1;
+print y;   // Should be 3
+
+i z;
+z = 2 * 3;
+print z;   // Should be 6
+
+i w;
+w = 1 + 2 * 3;
+print w;   // Should be 7
