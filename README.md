@@ -171,7 +171,9 @@ This project is part of an academic assignment. Please respect academic integrit
 
 ## Authors
 
-- **xackerlud31337** - Initial implementation
+- **Ivan Mandev** 
+- **Ivan Gyunderov**
+- **Darius Luca**
 
 ## Acknowledgments
 
